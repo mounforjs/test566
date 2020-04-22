@@ -1,0 +1,2359 @@
+diff -Naur drupal-7.56/CHANGELOG.txt drupal-7.58/CHANGELOG.txt
+--- drupal-7.56/CHANGELOG.txt	2017-06-21 20:20:18.000000000 +0200
++++ drupal-7.58/CHANGELOG.txt	2018-03-27 21:28:19.000000000 +0200
+@@ -1,4 +1,12 @@
+ 
++Drupal 7.58, 2018-03-28
++-----------------------
++- Fixed security issues (multiple vulnerabilities). See SA-CORE-2018-002.
++
++Drupal 7.57, 2018-02-21
++-----------------------
++- Fixed security issues (multiple vulnerabilities). See SA-CORE-2018-001.
++
+ Drupal 7.56, 2017-06-21
+ -----------------------
+ - Fixed security issues (access bypass). See SA-CORE-2017-003.
+diff -Naur drupal-7.56/includes/bootstrap.inc drupal-7.58/includes/bootstrap.inc
+--- drupal-7.56/includes/bootstrap.inc	2017-06-21 20:20:18.000000000 +0200
++++ drupal-7.58/includes/bootstrap.inc	2018-03-27 21:28:19.000000000 +0200
+@@ -8,7 +8,7 @@
+ /**
+  * The current system version.
+  */
+-define('VERSION', '7.56');
++define('VERSION', '7.58');
+ 
+ /**
+  * Core API compatibility.
+@@ -2632,6 +2632,10 @@
+   timer_start('page');
+   // Initialize the configuration, including variables from settings.php.
+   drupal_settings_initialize();
++
++  // Sanitize unsafe keys from the request.
++  require_once DRUPAL_ROOT . '/includes/request-sanitizer.inc';
++  DrupalRequestSanitizer::sanitize();
+ }
+ 
+ /**
+diff -Naur drupal-7.56/includes/common.inc drupal-7.58/includes/common.inc
+--- drupal-7.56/includes/common.inc	2017-06-21 20:20:18.000000000 +0200
++++ drupal-7.58/includes/common.inc	2018-03-27 21:28:19.000000000 +0200
+@@ -2236,8 +2236,11 @@
+     'prefix' => ''
+   );
+ 
++  // Determine whether this is an external link, but ensure that the current
++  // path is always treated as internal by default (to prevent external link
++  // injection vulnerabilities).
+   if (!isset($options['external'])) {
+-    $options['external'] = url_is_external($path);
++    $options['external'] = $path === $_GET['q'] ? FALSE : url_is_external($path);
+   }
+ 
+   // Preserve the original path before altering or aliasing.
+diff -Naur drupal-7.56/includes/request-sanitizer.inc drupal-7.58/includes/request-sanitizer.inc
+--- drupal-7.56/includes/request-sanitizer.inc	1970-01-01 01:00:00.000000000 +0100
++++ drupal-7.58/includes/request-sanitizer.inc	2018-03-27 21:28:19.000000000 +0200
+@@ -0,0 +1,82 @@
++<?php
++
++/**
++ * @file
++ * Contains code for sanitizing user input from the request.
++ */
++
++/**
++ * Sanitizes user input from the request.
++ */
++class DrupalRequestSanitizer {
++
++  /**
++   * Tracks whether the request was already sanitized.
++   */
++  protected static $sanitized = FALSE;
++
++  /**
++   * Modifies the request to strip dangerous keys from user input.
++   */
++  public static function sanitize() {
++    if (!self::$sanitized) {
++      $whitelist = variable_get('sanitize_input_whitelist', array());
++      $log_sanitized_keys = variable_get('sanitize_input_logging', FALSE);
++
++      // Process query string parameters.
++      $get_sanitized_keys = array();
++      $_GET = self::stripDangerousValues($_GET, $whitelist, $get_sanitized_keys);
++      if ($log_sanitized_keys && $get_sanitized_keys) {
++        _drupal_trigger_error_with_delayed_logging(format_string('Potentially unsafe keys removed from query string parameters (GET): @keys', array('@keys' => implode(', ', $get_sanitized_keys))), E_USER_NOTICE);
++      }
++
++      // Process request body parameters.
++      $post_sanitized_keys = array();
++      $_POST = self::stripDangerousValues($_POST, $whitelist, $post_sanitized_keys);
++      if ($log_sanitized_keys && $post_sanitized_keys) {
++        _drupal_trigger_error_with_delayed_logging(format_string('Potentially unsafe keys removed from request body parameters (POST): @keys', array('@keys' => implode(', ', $post_sanitized_keys))), E_USER_NOTICE);
++      }
++
++      // Process cookie parameters.
++      $cookie_sanitized_keys = array();
++      $_COOKIE = self::stripDangerousValues($_COOKIE, $whitelist, $cookie_sanitized_keys);
++      if ($log_sanitized_keys && $cookie_sanitized_keys) {
++        _drupal_trigger_error_with_delayed_logging(format_string('Potentially unsafe keys removed from cookie parameters (COOKIE): @keys', array('@keys' => implode(', ', $cookie_sanitized_keys))), E_USER_NOTICE);
++      }
++
++      $request_sanitized_keys = array();
++      $_REQUEST = self::stripDangerousValues($_REQUEST, $whitelist, $request_sanitized_keys);
++
++      self::$sanitized = TRUE;
++    }
++  }
++
++  /**
++   * Strips dangerous keys from the provided input.
++   *
++   * @param mixed $input
++   *   The input to sanitize.
++   * @param string[] $whitelist
++   *   An array of keys to whitelist as safe.
++   * @param string[] $sanitized_keys
++   *   An array of keys that have been removed.
++   *
++   * @return mixed
++   *   The sanitized input.
++   */
++  protected static function stripDangerousValues($input, array $whitelist, array &$sanitized_keys) {
++    if (is_array($input)) {
++      foreach ($input as $key => $value) {
++        if ($key !== '' && $key[0] === '#' && !in_array($key, $whitelist, TRUE)) {
++          unset($input[$key]);
++          $sanitized_keys[] = $key;
++        }
++        else {
++          $input[$key] = self::stripDangerousValues($input[$key], $whitelist, $sanitized_keys);
++        }
++      }
++    }
++    return $input;
++  }
++
++}
+diff -Naur drupal-7.56/misc/drupal.js drupal-7.58/misc/drupal.js
+--- drupal-7.56/misc/drupal.js	2017-06-21 20:20:18.000000000 +0200
++++ drupal-7.58/misc/drupal.js	2018-03-27 21:28:19.000000000 +0200
+@@ -28,6 +28,42 @@
+ $.fn.init.prototype = jquery_init.prototype;
+ 
+ /**
++ * Pre-filter Ajax requests to guard against XSS attacks.
++ *
++ * See https://github.com/jquery/jquery/issues/2432
++ */
++if ($.ajaxPrefilter) {
++  // For newer versions of jQuery, use an Ajax prefilter to prevent
++  // auto-executing script tags from untrusted domains. This is similar to the
++  // fix that is built in to jQuery 3.0 and higher.
++  $.ajaxPrefilter(function (s) {
++    if (s.crossDomain) {
++      s.contents.script = false;
++    }
++  });
++}
++else if ($.httpData) {
++  // For the version of jQuery that ships with Drupal core, override
++  // jQuery.httpData to prevent auto-detecting "script" data types from
++  // untrusted domains.
++  var jquery_httpData = $.httpData;
++  $.httpData = function (xhr, type, s) {
++    // @todo Consider backporting code from newer jQuery versions to check for
++    //   a cross-domain request here, rather than using Drupal.urlIsLocal() to
++    //   block scripts from all URLs that are not on the same site.
++    if (!type && !Drupal.urlIsLocal(s.url)) {
++      var content_type = xhr.getResponseHeader('content-type') || '';
++      if (content_type.indexOf('javascript') >= 0) {
++        // Default to a safe data type.
++        type = 'text';
++      }
++    }
++    return jquery_httpData.call(this, xhr, type, s);
++  };
++  $.httpData.prototype = jquery_httpData.prototype;
++}
++
++/**
+  * Attach all registered behaviors to a page element.
+  *
+  * Behaviors are event-triggered actions that attach to page elements, enhancing
+@@ -137,7 +173,7 @@
+  */
+ Drupal.checkPlain = function (str) {
+   var character, regex,
+-      replace = { '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' };
++      replace = { '&': '&amp;', "'": '&#39;', '"': '&quot;', '<': '&lt;', '>': '&gt;' };
+   str = String(str);
+   for (character in replace) {
+     if (replace.hasOwnProperty(character)) {
+diff -Naur drupal-7.56/modules/aggregator/aggregator.info drupal-7.58/modules/aggregator/aggregator.info
+--- drupal-7.56/modules/aggregator/aggregator.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/aggregator/aggregator.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ configure = admin/config/services/aggregator/settings
+ stylesheets[all][] = aggregator.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/aggregator/tests/aggregator_test.info drupal-7.58/modules/aggregator/tests/aggregator_test.info
+--- drupal-7.56/modules/aggregator/tests/aggregator_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/aggregator/tests/aggregator_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/block/block.info drupal-7.58/modules/block/block.info
+--- drupal-7.56/modules/block/block.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/block/block.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = block.test
+ configure = admin/structure/block
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/block/tests/block_test.info drupal-7.58/modules/block/tests/block_test.info
+--- drupal-7.56/modules/block/tests/block_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/block/tests/block_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/block/tests/themes/block_test_theme/block_test_theme.info drupal-7.58/modules/block/tests/themes/block_test_theme/block_test_theme.info
+--- drupal-7.56/modules/block/tests/themes/block_test_theme/block_test_theme.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/block/tests/themes/block_test_theme/block_test_theme.info	2018-03-28 21:06:59.000000000 +0200
+@@ -13,8 +13,8 @@
+ regions[highlighted] = Highlighted
+ regions[help] = Help
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/blog/blog.info drupal-7.58/modules/blog/blog.info
+--- drupal-7.56/modules/blog/blog.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/blog/blog.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ files[] = blog.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/book/book.info drupal-7.58/modules/book/book.info
+--- drupal-7.56/modules/book/book.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/book/book.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ configure = admin/content/book/settings
+ stylesheets[all][] = book.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/color/color.info drupal-7.58/modules/color/color.info
+--- drupal-7.56/modules/color/color.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/color/color.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ files[] = color.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/comment/comment.info drupal-7.58/modules/comment/comment.info
+--- drupal-7.56/modules/comment/comment.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/comment/comment.info	2018-03-28 21:06:59.000000000 +0200
+@@ -9,8 +9,8 @@
+ configure = admin/content/comment
+ stylesheets[all][] = comment.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/contact/contact.info drupal-7.58/modules/contact/contact.info
+--- drupal-7.56/modules/contact/contact.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/contact/contact.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = contact.test
+ configure = admin/structure/contact
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/contextual/contextual.info drupal-7.58/modules/contextual/contextual.info
+--- drupal-7.56/modules/contextual/contextual.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/contextual/contextual.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ files[] = contextual.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/dashboard/dashboard.info drupal-7.58/modules/dashboard/dashboard.info
+--- drupal-7.56/modules/dashboard/dashboard.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/dashboard/dashboard.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ dependencies[] = block
+ configure = admin/dashboard/customize
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/dblog/dblog.info drupal-7.58/modules/dblog/dblog.info
+--- drupal-7.56/modules/dblog/dblog.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/dblog/dblog.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ files[] = dblog.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/field/field.info drupal-7.58/modules/field/field.info
+--- drupal-7.56/modules/field/field.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/field/field.info	2018-03-28 21:06:59.000000000 +0200
+@@ -11,8 +11,8 @@
+ required = TRUE
+ stylesheets[all][] = theme/field.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/field/modules/field_sql_storage/field_sql_storage.info drupal-7.58/modules/field/modules/field_sql_storage/field_sql_storage.info
+--- drupal-7.56/modules/field/modules/field_sql_storage/field_sql_storage.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/field/modules/field_sql_storage/field_sql_storage.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ files[] = field_sql_storage.test
+ required = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/field/modules/list/list.info drupal-7.58/modules/field/modules/list/list.info
+--- drupal-7.56/modules/field/modules/list/list.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/field/modules/list/list.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ dependencies[] = options
+ files[] = tests/list.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/field/modules/list/tests/list_test.info drupal-7.58/modules/field/modules/list/tests/list_test.info
+--- drupal-7.56/modules/field/modules/list/tests/list_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/field/modules/list/tests/list_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/field/modules/number/number.info drupal-7.58/modules/field/modules/number/number.info
+--- drupal-7.56/modules/field/modules/number/number.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/field/modules/number/number.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ dependencies[] = field
+ files[] = number.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/field/modules/options/options.info drupal-7.58/modules/field/modules/options/options.info
+--- drupal-7.56/modules/field/modules/options/options.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/field/modules/options/options.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ dependencies[] = field
+ files[] = options.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/field/modules/text/text.info drupal-7.58/modules/field/modules/text/text.info
+--- drupal-7.56/modules/field/modules/text/text.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/field/modules/text/text.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ files[] = text.test
+ required = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/field/tests/field_test.info drupal-7.58/modules/field/tests/field_test.info
+--- drupal-7.56/modules/field/tests/field_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/field/tests/field_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/field_ui/field_ui.info drupal-7.58/modules/field_ui/field_ui.info
+--- drupal-7.56/modules/field_ui/field_ui.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/field_ui/field_ui.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ dependencies[] = field
+ files[] = field_ui.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/file/file.info drupal-7.58/modules/file/file.info
+--- drupal-7.56/modules/file/file.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/file/file.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ dependencies[] = field
+ files[] = tests/file.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/file/file.module drupal-7.58/modules/file/file.module
+--- drupal-7.56/modules/file/file.module	2017-06-21 20:20:18.000000000 +0200
++++ drupal-7.58/modules/file/file.module	2018-03-27 21:28:19.000000000 +0200
+@@ -140,7 +140,7 @@
+   }
+ 
+   // Find out which (if any) fields of this type contain the file.
+-  $references = file_get_file_references($file, NULL, FIELD_LOAD_CURRENT, $field_type);
++  $references = file_get_file_references($file, NULL, FIELD_LOAD_CURRENT, $field_type, FALSE);
+ 
+   // Stop processing if there are no references in order to avoid returning
+   // headers for files controlled by other modules. Make an exception for
+@@ -1067,11 +1067,18 @@
+  * @param $field_type
+  *   (optional) The name of a field type. If given, limits the reference check
+  *   to fields of the given type.
++ * @param $check_access
++ *   (optional) A boolean that specifies whether the permissions of the current
++ *   user should be checked when retrieving references. If FALSE, all
++ *   references to the file are returned. If TRUE, only references from
++ *   entities that the current user has access to are returned. Defaults to
++ *   TRUE for backwards compatibility reasons, but FALSE is recommended for
++ *   most situations.
+  *
+  * @return
+  *   An integer value.
+  */
+-function file_get_file_references($file, $field = NULL, $age = FIELD_LOAD_REVISION, $field_type = 'file') {
++function file_get_file_references($file, $field = NULL, $age = FIELD_LOAD_REVISION, $field_type = 'file', $check_access = TRUE) {
+   $references = drupal_static(__FUNCTION__, array());
+   $fields = isset($field) ? array($field['field_name'] => $field) : field_info_fields();
+ 
+@@ -1082,6 +1089,11 @@
+       $query
+         ->fieldCondition($file_field, 'fid', $file->fid)
+         ->age($age);
++      if (!$check_access) {
++        // Neutralize the 'entity_field_access' query tag added by
++        // field_sql_storage_field_storage_query().
++        $query->addTag('DANGEROUS_ACCESS_CHECK_OPT_OUT');
++      }
+       $references[$field_name] = $query->execute();
+     }
+   }
+diff -Naur drupal-7.56/modules/file/tests/file.test drupal-7.58/modules/file/tests/file.test
+--- drupal-7.56/modules/file/tests/file.test	2017-06-21 20:20:18.000000000 +0200
++++ drupal-7.58/modules/file/tests/file.test	2018-03-27 21:28:19.000000000 +0200
+@@ -1626,6 +1626,79 @@
+     $this->drupalGet($file_url);
+     $this->assertResponse(403, 'Confirmed that another anonymous user cannot access the permanent file when it is referenced by an unpublished node.');
+   }
++
++  /**
++   * Tests file access for private nodes when file download access is granted.
++   */
++  function testPrivateFileDownloadAccessGranted() {
++    // Tell file_module_test to attempt to grant access to all private files,
++    // and ensure that it is doing so correctly.
++    $test_file = $this->getTestFile('text');
++    $uri = file_unmanaged_move($test_file->uri, 'private://');
++    $file_url = file_create_url($uri);
++    $this->drupalGet($file_url);
++    $this->assertResponse(403, 'Access is not granted to an arbitrary private file by default.');
++    variable_set('file_module_test_grant_download_access', TRUE);
++    $this->drupalGet($file_url);
++    $this->assertResponse(200, 'Access is granted to an arbitrary private file after a module grants access to all private files in hook_file_download().');
++
++    // Create a public node with a file attached.
++    $type_name = 'page';
++    $field_name = strtolower($this->randomName());
++    $this->createFileField($field_name, $type_name, array('uri_scheme' => 'private'));
++    $test_file = $this->getTestFile('text');
++    $nid = $this->uploadNodeFile($test_file, $field_name, $type_name, TRUE, array('private' => FALSE));
++    $node = node_load($nid, NULL, TRUE);
++    $file_url = file_create_url($node->{$field_name}[LANGUAGE_NONE][0]['uri']);
++
++    // Unpublish the node and ensure that only administrators (not anonymous
++    // users) can access the node and download the file; the expectation is
++    // that the File module's hook_file_download() implementation will deny
++    // access and thereby override the file_module_test module's access grant.
++    $node->status = NODE_NOT_PUBLISHED;
++    node_save($node);
++    $this->drupalLogin($this->admin_user);
++    $this->drupalGet("node/$nid");
++    $this->assertResponse(200, 'Administrator can access the unpublished node.');
++    $this->drupalGet($file_url);
++    $this->assertResponse(200, 'Administrator can download the file attached to the unpublished node.');
++    $this->drupalLogOut();
++    $this->drupalGet("node/$nid");
++    $this->assertResponse(403, 'Anonymous user cannot access the unpublished node.');
++    $this->drupalGet($file_url);
++    $this->assertResponse(403, 'Anonymous user cannot download the file attached to the unpublished node.');
++
++    // Re-publish the node and ensure that the node and file can be accessed by
++    // everyone.
++    $node->status = NODE_PUBLISHED;
++    node_save($node);
++    $this->drupalLogin($this->admin_user);
++    $this->drupalGet("node/$nid");
++    $this->assertResponse(200, 'Administrator can access the published node.');
++    $this->drupalGet($file_url);
++    $this->assertResponse(200, 'Administrator can download the file attached to the published node.');
++    $this->drupalLogOut();
++    $this->drupalGet("node/$nid");
++    $this->assertResponse(200, 'Anonymous user can access the published node.');
++    $this->drupalGet($file_url);
++    $this->assertResponse(200, 'Anonymous user can download the file attached to the published node.');
++
++    // Make the node private via the node access system and test that only
++    // administrators (not anonymous users) can access the node and download
++    // the file.
++    $node->private = TRUE;
++    node_save($node);
++    $this->drupalLogin($this->admin_user);
++    $this->drupalGet("node/$nid");
++    $this->assertResponse(200, 'Administrator can access the private node.');
++    $this->drupalGet($file_url);
++    $this->assertResponse(200, 'Administrator can download the file attached to the private node.');
++    $this->drupalLogOut();
++    $this->drupalGet("node/$nid");
++    $this->assertResponse(403, 'Anonymous user cannot access the private node.');
++    $this->drupalGet($file_url);
++    $this->assertResponse(403, 'Anonymous user cannot download the file attached to the private node.');
++  }
+ }
+ 
+ /**
+diff -Naur drupal-7.56/modules/file/tests/file_module_test.info drupal-7.58/modules/file/tests/file_module_test.info
+--- drupal-7.56/modules/file/tests/file_module_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/file/tests/file_module_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/file/tests/file_module_test.module drupal-7.58/modules/file/tests/file_module_test.module
+--- drupal-7.56/modules/file/tests/file_module_test.module	2017-06-21 20:20:18.000000000 +0200
++++ drupal-7.58/modules/file/tests/file_module_test.module	2018-03-27 21:28:19.000000000 +0200
+@@ -67,3 +67,18 @@
+   }
+   drupal_set_message(t('The file id is %fid.', array('%fid' => $fid)));
+ }
++
++/**
++ * Implements hook_file_download().
++ */
++function file_module_test_file_download($uri) {
++  if (variable_get('file_module_test_grant_download_access')) {
++    // Mimic what file_get_content_headers() would do if we had a full $file
++    // object to pass to it.
++    return array(
++      'Content-Type' => mime_header_encode(file_get_mimetype($uri)),
++      'Content-Length' => filesize($uri),
++      'Cache-Control' => 'private',
++    );
++  }
++}
+diff -Naur drupal-7.56/modules/filter/filter.info drupal-7.58/modules/filter/filter.info
+--- drupal-7.56/modules/filter/filter.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/filter/filter.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ required = TRUE
+ configure = admin/config/content/formats
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/forum/forum.info drupal-7.58/modules/forum/forum.info
+--- drupal-7.56/modules/forum/forum.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/forum/forum.info	2018-03-28 21:06:59.000000000 +0200
+@@ -9,8 +9,8 @@
+ configure = admin/structure/forum
+ stylesheets[all][] = forum.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/help/help.info drupal-7.58/modules/help/help.info
+--- drupal-7.56/modules/help/help.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/help/help.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ files[] = help.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/image/image.info drupal-7.58/modules/image/image.info
+--- drupal-7.56/modules/image/image.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/image/image.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ files[] = image.test
+ configure = admin/config/media/image-styles
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/image/tests/image_module_test.info drupal-7.58/modules/image/tests/image_module_test.info
+--- drupal-7.56/modules/image/tests/image_module_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/image/tests/image_module_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = image_module_test.module
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/locale/locale.info drupal-7.58/modules/locale/locale.info
+--- drupal-7.56/modules/locale/locale.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/locale/locale.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = locale.test
+ configure = admin/config/regional/language
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/locale/tests/locale_test.info drupal-7.58/modules/locale/tests/locale_test.info
+--- drupal-7.56/modules/locale/tests/locale_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/locale/tests/locale_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/menu/menu.info drupal-7.58/modules/menu/menu.info
+--- drupal-7.56/modules/menu/menu.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/menu/menu.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = menu.test
+ configure = admin/structure/menu
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/node/node.info drupal-7.58/modules/node/node.info
+--- drupal-7.56/modules/node/node.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/node/node.info	2018-03-28 21:06:59.000000000 +0200
+@@ -9,8 +9,8 @@
+ configure = admin/structure/types
+ stylesheets[all][] = node.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/node/tests/node_access_test.info drupal-7.58/modules/node/tests/node_access_test.info
+--- drupal-7.56/modules/node/tests/node_access_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/node/tests/node_access_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/node/tests/node_test.info drupal-7.58/modules/node/tests/node_test.info
+--- drupal-7.56/modules/node/tests/node_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/node/tests/node_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/node/tests/node_test_exception.info drupal-7.58/modules/node/tests/node_test_exception.info
+--- drupal-7.56/modules/node/tests/node_test_exception.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/node/tests/node_test_exception.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/openid/openid.info drupal-7.58/modules/openid/openid.info
+--- drupal-7.56/modules/openid/openid.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/openid/openid.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ files[] = openid.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/openid/tests/openid_test.info drupal-7.58/modules/openid/tests/openid_test.info
+--- drupal-7.56/modules/openid/tests/openid_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/openid/tests/openid_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ dependencies[] = openid
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/overlay/overlay.info drupal-7.58/modules/overlay/overlay.info
+--- drupal-7.56/modules/overlay/overlay.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/overlay/overlay.info	2018-03-28 21:06:59.000000000 +0200
+@@ -4,8 +4,8 @@
+ version = VERSION
+ core = 7.x
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/path/path.info drupal-7.58/modules/path/path.info
+--- drupal-7.56/modules/path/path.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/path/path.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = path.test
+ configure = admin/config/search/path
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/php/php.info drupal-7.58/modules/php/php.info
+--- drupal-7.56/modules/php/php.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/php/php.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ files[] = php.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/poll/poll.info drupal-7.58/modules/poll/poll.info
+--- drupal-7.56/modules/poll/poll.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/poll/poll.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = poll.test
+ stylesheets[all][] = poll.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/profile/profile.info drupal-7.58/modules/profile/profile.info
+--- drupal-7.56/modules/profile/profile.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/profile/profile.info	2018-03-28 21:06:59.000000000 +0200
+@@ -11,8 +11,8 @@
+ ; See user_system_info_alter().
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/rdf/rdf.info drupal-7.58/modules/rdf/rdf.info
+--- drupal-7.56/modules/rdf/rdf.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/rdf/rdf.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ files[] = rdf.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/rdf/tests/rdf_test.info drupal-7.58/modules/rdf/tests/rdf_test.info
+--- drupal-7.56/modules/rdf/tests/rdf_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/rdf/tests/rdf_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ hidden = TRUE
+ dependencies[] = blog
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/search/search.info drupal-7.58/modules/search/search.info
+--- drupal-7.56/modules/search/search.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/search/search.info	2018-03-28 21:06:59.000000000 +0200
+@@ -8,8 +8,8 @@
+ configure = admin/config/search/settings
+ stylesheets[all][] = search.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/search/tests/search_embedded_form.info drupal-7.58/modules/search/tests/search_embedded_form.info
+--- drupal-7.56/modules/search/tests/search_embedded_form.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/search/tests/search_embedded_form.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/search/tests/search_extra_type.info drupal-7.58/modules/search/tests/search_extra_type.info
+--- drupal-7.56/modules/search/tests/search_extra_type.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/search/tests/search_extra_type.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/search/tests/search_node_tags.info drupal-7.58/modules/search/tests/search_node_tags.info
+--- drupal-7.56/modules/search/tests/search_node_tags.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/search/tests/search_node_tags.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/shortcut/shortcut.info drupal-7.58/modules/shortcut/shortcut.info
+--- drupal-7.56/modules/shortcut/shortcut.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/shortcut/shortcut.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = shortcut.test
+ configure = admin/config/user-interface/shortcut
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/simpletest.info drupal-7.58/modules/simpletest/simpletest.info
+--- drupal-7.56/modules/simpletest/simpletest.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/simpletest.info	2018-03-28 21:06:59.000000000 +0200
+@@ -57,8 +57,8 @@
+ files[] = tests/upgrade/update.field.test
+ files[] = tests/upgrade/update.user.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/actions_loop_test.info drupal-7.58/modules/simpletest/tests/actions_loop_test.info
+--- drupal-7.56/modules/simpletest/tests/actions_loop_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/actions_loop_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/ajax_forms_test.info drupal-7.58/modules/simpletest/tests/ajax_forms_test.info
+--- drupal-7.56/modules/simpletest/tests/ajax_forms_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/ajax_forms_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/ajax_test.info drupal-7.58/modules/simpletest/tests/ajax_test.info
+--- drupal-7.56/modules/simpletest/tests/ajax_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/ajax_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/batch_test.info drupal-7.58/modules/simpletest/tests/batch_test.info
+--- drupal-7.56/modules/simpletest/tests/batch_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/batch_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/boot_test_1.info drupal-7.58/modules/simpletest/tests/boot_test_1.info
+--- drupal-7.56/modules/simpletest/tests/boot_test_1.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/boot_test_1.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/boot_test_2.info drupal-7.58/modules/simpletest/tests/boot_test_2.info
+--- drupal-7.56/modules/simpletest/tests/boot_test_2.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/boot_test_2.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/common.test drupal-7.58/modules/simpletest/tests/common.test
+--- drupal-7.56/modules/simpletest/tests/common.test	2017-06-21 20:20:18.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/common.test	2018-03-27 21:28:19.000000000 +0200
+@@ -76,7 +76,7 @@
+ class CommonURLUnitTest extends DrupalWebTestCase {
+   public static function getInfo() {
+     return array(
+-      'name' => 'URL generation tests',
++      'name' => 'URL generation unit tests',
+       'description' => 'Confirm that url(), drupal_get_query_parameters(), drupal_http_build_query(), and l() work correctly with various input.',
+       'group' => 'System',
+     );
+@@ -373,6 +373,38 @@
+ }
+ 
+ /**
++ * Web tests for URL generation functions.
++ */
++class CommonURLWebTest extends DrupalWebTestCase {
++  public static function getInfo() {
++    return array(
++      'name' => 'URL generation web tests',
++      'description' => 'Confirm that URL-generating functions work correctly on specific site paths.',
++      'group' => 'System',
++    );
++  }
++
++  function setUp() {
++    parent::setUp('common_test');
++  }
++
++  /**
++   * Tests the url() function on internal paths which mimic external URLs.
++   */
++  function testInternalPathMimicsExternal() {
++    // Ensure that calling url(current_path()) on "/http://example.com" (an
++    // internal path which mimics an external URL) always links to the internal
++    // path, not the external URL. This helps protect against external URL link
++    // injection vulnerabilities.
++    variable_set('common_test_link_to_current_path', TRUE);
++    $this->drupalGet('/http://example.com');
++    $this->clickLink('link which should point to the current path');
++    $this->assertUrl('/http://example.com');
++    $this->assertText('link which should point to the current path');
++  }
++}
++
++/**
+  * Tests url_is_external().
+  */
+ class UrlIsExternalUnitTest extends DrupalUnitTestCase {
+diff -Naur drupal-7.56/modules/simpletest/tests/common_test.info drupal-7.58/modules/simpletest/tests/common_test.info
+--- drupal-7.56/modules/simpletest/tests/common_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/common_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ stylesheets[print][] = common_test.print.css
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/common_test.module drupal-7.58/modules/simpletest/tests/common_test.module
+--- drupal-7.56/modules/simpletest/tests/common_test.module	2017-06-21 20:20:18.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/common_test.module	2018-03-27 21:28:19.000000000 +0200
+@@ -99,6 +99,9 @@
+   if (variable_get('common_test_redirect_current_path', FALSE)) {
+     drupal_goto(current_path());
+   }
++  if (variable_get('common_test_link_to_current_path', FALSE)) {
++    drupal_set_message(l('link which should point to the current path', current_path()));
++  }
+ }
+ 
+ /**
+diff -Naur drupal-7.56/modules/simpletest/tests/common_test_cron_helper.info drupal-7.58/modules/simpletest/tests/common_test_cron_helper.info
+--- drupal-7.56/modules/simpletest/tests/common_test_cron_helper.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/common_test_cron_helper.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/database_test.info drupal-7.58/modules/simpletest/tests/database_test.info
+--- drupal-7.56/modules/simpletest/tests/database_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/database_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/drupal_autoload_test/drupal_autoload_test.info drupal-7.58/modules/simpletest/tests/drupal_autoload_test/drupal_autoload_test.info
+--- drupal-7.56/modules/simpletest/tests/drupal_autoload_test/drupal_autoload_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/drupal_autoload_test/drupal_autoload_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info drupal-7.58/modules/simpletest/tests/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info
+--- drupal-7.56/modules/simpletest/tests/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info drupal-7.58/modules/simpletest/tests/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info
+--- drupal-7.56/modules/simpletest/tests/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/entity_cache_test.info drupal-7.58/modules/simpletest/tests/entity_cache_test.info
+--- drupal-7.56/modules/simpletest/tests/entity_cache_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/entity_cache_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ dependencies[] = entity_cache_test_dependency
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/entity_cache_test_dependency.info drupal-7.58/modules/simpletest/tests/entity_cache_test_dependency.info
+--- drupal-7.56/modules/simpletest/tests/entity_cache_test_dependency.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/entity_cache_test_dependency.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/entity_crud_hook_test.info drupal-7.58/modules/simpletest/tests/entity_crud_hook_test.info
+--- drupal-7.56/modules/simpletest/tests/entity_crud_hook_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/entity_crud_hook_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/entity_query_access_test.info drupal-7.58/modules/simpletest/tests/entity_query_access_test.info
+--- drupal-7.56/modules/simpletest/tests/entity_query_access_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/entity_query_access_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/error_test.info drupal-7.58/modules/simpletest/tests/error_test.info
+--- drupal-7.56/modules/simpletest/tests/error_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/error_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/file_test.info drupal-7.58/modules/simpletest/tests/file_test.info
+--- drupal-7.56/modules/simpletest/tests/file_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/file_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = file_test.module
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/filter_test.info drupal-7.58/modules/simpletest/tests/filter_test.info
+--- drupal-7.56/modules/simpletest/tests/filter_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/filter_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/form_test.info drupal-7.58/modules/simpletest/tests/form_test.info
+--- drupal-7.56/modules/simpletest/tests/form_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/form_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/image_test.info drupal-7.58/modules/simpletest/tests/image_test.info
+--- drupal-7.56/modules/simpletest/tests/image_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/image_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/menu_test.info drupal-7.58/modules/simpletest/tests/menu_test.info
+--- drupal-7.56/modules/simpletest/tests/menu_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/menu_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/module_test.info drupal-7.58/modules/simpletest/tests/module_test.info
+--- drupal-7.56/modules/simpletest/tests/module_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/module_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/path_test.info drupal-7.58/modules/simpletest/tests/path_test.info
+--- drupal-7.56/modules/simpletest/tests/path_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/path_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/psr_0_test/psr_0_test.info drupal-7.58/modules/simpletest/tests/psr_0_test/psr_0_test.info
+--- drupal-7.56/modules/simpletest/tests/psr_0_test/psr_0_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/psr_0_test/psr_0_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ hidden = TRUE
+ package = Testing
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/psr_4_test/psr_4_test.info drupal-7.58/modules/simpletest/tests/psr_4_test/psr_4_test.info
+--- drupal-7.56/modules/simpletest/tests/psr_4_test/psr_4_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/psr_4_test/psr_4_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ hidden = TRUE
+ package = Testing
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/requirements1_test.info drupal-7.58/modules/simpletest/tests/requirements1_test.info
+--- drupal-7.56/modules/simpletest/tests/requirements1_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/requirements1_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/requirements2_test.info drupal-7.58/modules/simpletest/tests/requirements2_test.info
+--- drupal-7.56/modules/simpletest/tests/requirements2_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/requirements2_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/session_test.info drupal-7.58/modules/simpletest/tests/session_test.info
+--- drupal-7.56/modules/simpletest/tests/session_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/session_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/system_dependencies_test.info drupal-7.58/modules/simpletest/tests/system_dependencies_test.info
+--- drupal-7.56/modules/simpletest/tests/system_dependencies_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/system_dependencies_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ hidden = TRUE
+ dependencies[] = _missing_dependency
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/system_incompatible_core_version_dependencies_test.info drupal-7.58/modules/simpletest/tests/system_incompatible_core_version_dependencies_test.info
+--- drupal-7.56/modules/simpletest/tests/system_incompatible_core_version_dependencies_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/system_incompatible_core_version_dependencies_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ hidden = TRUE
+ dependencies[] = system_incompatible_core_version_test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/system_incompatible_core_version_test.info drupal-7.58/modules/simpletest/tests/system_incompatible_core_version_test.info
+--- drupal-7.56/modules/simpletest/tests/system_incompatible_core_version_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/system_incompatible_core_version_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 5.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/system_incompatible_module_version_dependencies_test.info drupal-7.58/modules/simpletest/tests/system_incompatible_module_version_dependencies_test.info
+--- drupal-7.56/modules/simpletest/tests/system_incompatible_module_version_dependencies_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/system_incompatible_module_version_dependencies_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ ; system_incompatible_module_version_test declares version 1.0
+ dependencies[] = system_incompatible_module_version_test (>2.0)
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/system_incompatible_module_version_test.info drupal-7.58/modules/simpletest/tests/system_incompatible_module_version_test.info
+--- drupal-7.56/modules/simpletest/tests/system_incompatible_module_version_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/system_incompatible_module_version_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/system_project_namespace_test.info drupal-7.58/modules/simpletest/tests/system_project_namespace_test.info
+--- drupal-7.56/modules/simpletest/tests/system_project_namespace_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/system_project_namespace_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ hidden = TRUE
+ dependencies[] = drupal:filter
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/system_test.info drupal-7.58/modules/simpletest/tests/system_test.info
+--- drupal-7.56/modules/simpletest/tests/system_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/system_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = system_test.module
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/taxonomy_test.info drupal-7.58/modules/simpletest/tests/taxonomy_test.info
+--- drupal-7.56/modules/simpletest/tests/taxonomy_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/taxonomy_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ hidden = TRUE
+ dependencies[] = taxonomy
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/theme_test.info drupal-7.58/modules/simpletest/tests/theme_test.info
+--- drupal-7.56/modules/simpletest/tests/theme_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/theme_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/themes/test_basetheme/test_basetheme.info drupal-7.58/modules/simpletest/tests/themes/test_basetheme/test_basetheme.info
+--- drupal-7.56/modules/simpletest/tests/themes/test_basetheme/test_basetheme.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/themes/test_basetheme/test_basetheme.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ settings[basetheme_only] = base theme value
+ settings[subtheme_override] = base theme value
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/themes/test_subtheme/test_subtheme.info drupal-7.58/modules/simpletest/tests/themes/test_subtheme/test_subtheme.info
+--- drupal-7.56/modules/simpletest/tests/themes/test_subtheme/test_subtheme.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/themes/test_subtheme/test_subtheme.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ 
+ settings[subtheme_override] = subtheme value
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/themes/test_theme/test_theme.info drupal-7.58/modules/simpletest/tests/themes/test_theme/test_theme.info
+--- drupal-7.56/modules/simpletest/tests/themes/test_theme/test_theme.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/themes/test_theme/test_theme.info	2018-03-28 21:06:59.000000000 +0200
+@@ -17,8 +17,8 @@
+ 
+ settings[theme_test_setting] = default value
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/themes/test_theme_nyan_cat/test_theme_nyan_cat.info drupal-7.58/modules/simpletest/tests/themes/test_theme_nyan_cat/test_theme_nyan_cat.info
+--- drupal-7.56/modules/simpletest/tests/themes/test_theme_nyan_cat/test_theme_nyan_cat.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/themes/test_theme_nyan_cat/test_theme_nyan_cat.info	2018-03-28 21:06:59.000000000 +0200
+@@ -4,8 +4,8 @@
+ hidden = TRUE
+ engine = nyan_cat
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/update_script_test.info drupal-7.58/modules/simpletest/tests/update_script_test.info
+--- drupal-7.56/modules/simpletest/tests/update_script_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/update_script_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/update_test_1.info drupal-7.58/modules/simpletest/tests/update_test_1.info
+--- drupal-7.56/modules/simpletest/tests/update_test_1.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/update_test_1.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/update_test_2.info drupal-7.58/modules/simpletest/tests/update_test_2.info
+--- drupal-7.56/modules/simpletest/tests/update_test_2.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/update_test_2.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/update_test_3.info drupal-7.58/modules/simpletest/tests/update_test_3.info
+--- drupal-7.56/modules/simpletest/tests/update_test_3.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/update_test_3.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/url_alter_test.info drupal-7.58/modules/simpletest/tests/url_alter_test.info
+--- drupal-7.56/modules/simpletest/tests/url_alter_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/url_alter_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/simpletest/tests/xmlrpc_test.info drupal-7.58/modules/simpletest/tests/xmlrpc_test.info
+--- drupal-7.56/modules/simpletest/tests/xmlrpc_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/simpletest/tests/xmlrpc_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/statistics/statistics.info drupal-7.58/modules/statistics/statistics.info
+--- drupal-7.56/modules/statistics/statistics.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/statistics/statistics.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = statistics.test
+ configure = admin/config/system/statistics
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/syslog/syslog.info drupal-7.58/modules/syslog/syslog.info
+--- drupal-7.56/modules/syslog/syslog.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/syslog/syslog.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = syslog.test
+ configure = admin/config/development/logging
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/system/system.info drupal-7.58/modules/system/system.info
+--- drupal-7.56/modules/system/system.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/system/system.info	2018-03-28 21:06:59.000000000 +0200
+@@ -12,8 +12,8 @@
+ required = TRUE
+ configure = admin/config/system
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/system/tests/cron_queue_test.info drupal-7.58/modules/system/tests/cron_queue_test.info
+--- drupal-7.56/modules/system/tests/cron_queue_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/system/tests/cron_queue_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/system/tests/system_cron_test.info drupal-7.58/modules/system/tests/system_cron_test.info
+--- drupal-7.56/modules/system/tests/system_cron_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/system/tests/system_cron_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/taxonomy/taxonomy.info drupal-7.58/modules/taxonomy/taxonomy.info
+--- drupal-7.56/modules/taxonomy/taxonomy.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/taxonomy/taxonomy.info	2018-03-28 21:06:59.000000000 +0200
+@@ -8,8 +8,8 @@
+ files[] = taxonomy.test
+ configure = admin/structure/taxonomy
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/toolbar/toolbar.info drupal-7.58/modules/toolbar/toolbar.info
+--- drupal-7.56/modules/toolbar/toolbar.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/toolbar/toolbar.info	2018-03-28 21:06:59.000000000 +0200
+@@ -4,8 +4,8 @@
+ package = Core
+ version = VERSION
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/tracker/tracker.info drupal-7.58/modules/tracker/tracker.info
+--- drupal-7.56/modules/tracker/tracker.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/tracker/tracker.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ core = 7.x
+ files[] = tracker.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/translation/tests/translation_test.info drupal-7.58/modules/translation/tests/translation_test.info
+--- drupal-7.56/modules/translation/tests/translation_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/translation/tests/translation_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ version = VERSION
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/translation/translation.info drupal-7.58/modules/translation/translation.info
+--- drupal-7.56/modules/translation/translation.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/translation/translation.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ core = 7.x
+ files[] = translation.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/trigger/tests/trigger_test.info drupal-7.58/modules/trigger/tests/trigger_test.info
+--- drupal-7.56/modules/trigger/tests/trigger_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/trigger/tests/trigger_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -4,8 +4,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/trigger/trigger.info drupal-7.58/modules/trigger/trigger.info
+--- drupal-7.56/modules/trigger/trigger.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/trigger/trigger.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = trigger.test
+ configure = admin/structure/trigger
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/update/tests/aaa_update_test.info drupal-7.58/modules/update/tests/aaa_update_test.info
+--- drupal-7.56/modules/update/tests/aaa_update_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/update/tests/aaa_update_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -4,8 +4,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/update/tests/bbb_update_test.info drupal-7.58/modules/update/tests/bbb_update_test.info
+--- drupal-7.56/modules/update/tests/bbb_update_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/update/tests/bbb_update_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -4,8 +4,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/update/tests/ccc_update_test.info drupal-7.58/modules/update/tests/ccc_update_test.info
+--- drupal-7.56/modules/update/tests/ccc_update_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/update/tests/ccc_update_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -4,8 +4,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/update/tests/themes/update_test_admintheme/update_test_admintheme.info drupal-7.58/modules/update/tests/themes/update_test_admintheme/update_test_admintheme.info
+--- drupal-7.56/modules/update/tests/themes/update_test_admintheme/update_test_admintheme.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/update/tests/themes/update_test_admintheme/update_test_admintheme.info	2018-03-28 21:06:59.000000000 +0200
+@@ -3,8 +3,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/update/tests/themes/update_test_basetheme/update_test_basetheme.info drupal-7.58/modules/update/tests/themes/update_test_basetheme/update_test_basetheme.info
+--- drupal-7.56/modules/update/tests/themes/update_test_basetheme/update_test_basetheme.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/update/tests/themes/update_test_basetheme/update_test_basetheme.info	2018-03-28 21:06:59.000000000 +0200
+@@ -3,8 +3,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/update/tests/themes/update_test_subtheme/update_test_subtheme.info drupal-7.58/modules/update/tests/themes/update_test_subtheme/update_test_subtheme.info
+--- drupal-7.56/modules/update/tests/themes/update_test_subtheme/update_test_subtheme.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/update/tests/themes/update_test_subtheme/update_test_subtheme.info	2018-03-28 21:06:59.000000000 +0200
+@@ -4,8 +4,8 @@
+ base theme = update_test_basetheme
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/update/tests/update_test.info drupal-7.58/modules/update/tests/update_test.info
+--- drupal-7.56/modules/update/tests/update_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/update/tests/update_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/update/update.info drupal-7.58/modules/update/update.info
+--- drupal-7.56/modules/update/update.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/update/update.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ files[] = update.test
+ configure = admin/reports/updates/settings
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/user/tests/user_form_test.info drupal-7.58/modules/user/tests/user_form_test.info
+--- drupal-7.56/modules/user/tests/user_form_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/user/tests/user_form_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/modules/user/user.info drupal-7.58/modules/user/user.info
+--- drupal-7.56/modules/user/user.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/modules/user/user.info	2018-03-28 21:06:59.000000000 +0200
+@@ -9,8 +9,8 @@
+ configure = admin/config/people
+ stylesheets[all][] = user.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/profiles/minimal/minimal.info drupal-7.58/profiles/minimal/minimal.info
+--- drupal-7.56/profiles/minimal/minimal.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/profiles/minimal/minimal.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ dependencies[] = block
+ dependencies[] = dblog
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/profiles/standard/standard.info drupal-7.58/profiles/standard/standard.info
+--- drupal-7.56/profiles/standard/standard.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/profiles/standard/standard.info	2018-03-28 21:06:59.000000000 +0200
+@@ -24,8 +24,8 @@
+ dependencies[] = file
+ dependencies[] = rdf
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/profiles/testing/modules/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info drupal-7.58/profiles/testing/modules/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info
+--- drupal-7.56/profiles/testing/modules/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/profiles/testing/modules/drupal_system_listing_compatible_test/drupal_system_listing_compatible_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -6,8 +6,8 @@
+ hidden = TRUE
+ files[] = drupal_system_listing_compatible_test.test
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/profiles/testing/modules/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info drupal-7.58/profiles/testing/modules/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info
+--- drupal-7.56/profiles/testing/modules/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/profiles/testing/modules/drupal_system_listing_incompatible_test/drupal_system_listing_incompatible_test.info	2018-03-28 21:06:59.000000000 +0200
+@@ -8,8 +8,8 @@
+ core = 6.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/profiles/testing/testing.info drupal-7.58/profiles/testing/testing.info
+--- drupal-7.56/profiles/testing/testing.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/profiles/testing/testing.info	2018-03-28 21:06:59.000000000 +0200
+@@ -4,8 +4,8 @@
+ core = 7.x
+ hidden = TRUE
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/themes/bartik/bartik.info drupal-7.58/themes/bartik/bartik.info
+--- drupal-7.56/themes/bartik/bartik.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/themes/bartik/bartik.info	2018-03-28 21:06:59.000000000 +0200
+@@ -34,8 +34,8 @@
+ settings[shortcut_module_link] = 0
+ 
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/themes/garland/garland.info drupal-7.58/themes/garland/garland.info
+--- drupal-7.56/themes/garland/garland.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/themes/garland/garland.info	2018-03-28 21:06:59.000000000 +0200
+@@ -7,8 +7,8 @@
+ stylesheets[print][] = print.css
+ settings[garland_width] = fluid
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/themes/seven/seven.info drupal-7.58/themes/seven/seven.info
+--- drupal-7.56/themes/seven/seven.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/themes/seven/seven.info	2018-03-28 21:06:59.000000000 +0200
+@@ -13,8 +13,8 @@
+ regions[sidebar_first] = First sidebar
+ regions_hidden[] = sidebar_first
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
+diff -Naur drupal-7.56/themes/stark/stark.info drupal-7.58/themes/stark/stark.info
+--- drupal-7.56/themes/stark/stark.info	2017-06-21 20:30:49.000000000 +0200
++++ drupal-7.58/themes/stark/stark.info	2018-03-28 21:06:59.000000000 +0200
+@@ -5,8 +5,8 @@
+ core = 7.x
+ stylesheets[all][] = layout.css
+ 
+-; Information added by Drupal.org packaging script on 2017-06-21
+-version = "7.56"
++; Information added by Drupal.org packaging script on 2018-03-28
++version = "7.58"
+ project = "drupal"
+-datestamp = "1498069849"
++datestamp = "1522264019"
+ 
